@@ -1,6 +1,6 @@
 use yaxpeax_x86::long_mode::Opcode;
 use yaxpeax_x86::long_mode::{Arch as x86_64};
-use yaxpeax_arch::Arch;
+use yaxpeax_arch::{Arch, AddressDiff};
 use analyses::control_flow;
 use analyses::Value;
 use data::ValueLocations;
