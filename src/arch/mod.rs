@@ -742,3 +742,58 @@ impl <'a, Addr: Address, M: MemoryRepr<Addr> + MemoryRange<Addr>, Instr, D: Deco
         }*/
     }
 }
+
+impl <'a, Addr: Address, M: MemoryRepr<Addr> + MemoryRange<Addr>, Instr: Copy, D: Decoder<Instr>>
+    Iterator for InstructionIteratorSpanned<'a, Addr, M, Instr, D>
+where Instr: LengthedInstruction<Unit=AddressDiff<Addr>> + Default {
+    type Item = (Addr, Instr);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.elem.is_some() {
+            let instr: &mut Instr = self.elem.as_mut().unwrap();
+            //  TODO: check for wrappipng..
+            match Some(self.current.add(instr.len())) {
+                Some(next) => {
+                    if next <= self.end {
+                        self.current = next;
+                        if let Some(range) = self.data.range_from(self.current) {
+                            match self.decoder.decode_into(instr, range) {
+                                Ok(()) => {
+                                    Some((self.current, *instr))
+                                },
+                                Err(_) => None
+                            }
+                        } else {
+                            //println!("BUG: No data available for {}", self.current.show());
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                None => None
+            }
+        } else {
+            if self.current <= self.end {
+                if let Some(range) = self.data.range_from(self.current) {
+                    self.elem = self.decoder.decode(range).ok();
+                    match self.elem {
+                        Some(ref instr) => {
+                            Some((self.current, *instr))
+                        },
+                        None => None
+                    }
+                } else {
+                    //println!("BUG: No data available for {}", self.current.show());
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        /*
+            None => {
+            }
+        }*/
+    }
+}
