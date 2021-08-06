@@ -4,7 +4,7 @@ use std::hash::Hash;
 use termion::color;
 
 use SyntaxedSSARender;
-use yaxpeax_arch::{Arch, ColorSettings, LengthedInstruction};
+use yaxpeax_arch::{Arch, Colorize, ColorSettings, LengthedInstruction};
 use arch::display::BaseDisplay;
 use arch::CommentQuery;
 use arch::FunctionQuery;
@@ -27,7 +27,7 @@ impl <T> SyntaxedSSARender<PIC17, T, pic17::Function> for yaxpeax_pic17::Instruc
     fn render_with_ssa_values(
         &self,
         address: <PIC17 as Arch>::Address,
-        _colors: Option<&ColorSettings>,
+        colors: Option<&ColorSettings>,
         context: Option<&T>,
         function_table: &HashMap<<PIC17 as Arch>::Address, pic17::Function>,
         ssa: &SSA<PIC17>) -> String {
@@ -75,12 +75,8 @@ impl <T> SyntaxedSSARender<PIC17, T, pic17::Function> for yaxpeax_pic17::Instruc
             }
         }
 
-        let start_color = yaxpeax_pic17::opcode_color(self.opcode);
-        let mut result = format!("{}{}{}",
-             start_color,
-             self.opcode,
-             color::Fg(color::Reset)
-         );
+        let mut result = String::new();
+        self.opcode.colorize(&colors, &mut result).expect("can append colorized opcode");
 
         match self.opcode {
             Opcode::LCALL => {
@@ -196,7 +192,7 @@ pub fn render_instruction_with_ssa_values<T>(
     println!(" {}", instr.render_with_ssa_values(address, colors, ctx, function_table, ssa))
 }
 
-pub fn show_linear_with_blocks<M: MemoryRange<<PIC17 as Arch>::Address>>(
+pub fn show_linear_with_blocks<M: MemoryRange<PIC17>>(
     _data: &M,
     _ctx: &pic17::MergedContextTable,
     _function_table: &HashMap<<PIC17 as Arch>::Address, pic17::Function>,
@@ -243,7 +239,7 @@ pub fn show_functions(
 
 }
 
-pub fn show_function_by_ssa<M: MemoryRange<<PIC17 as Arch>::Address>>(
+pub fn show_function_by_ssa<M: MemoryRange<PIC17>>(
     data: &M,
     colors: Option<&ColorSettings>,
     ctx: &pic17::MergedContextTable,
@@ -265,7 +261,9 @@ pub fn show_function_by_ssa<M: MemoryRange<<PIC17 as Arch>::Address>>(
             println!("phi: {:?}", ssa.phi[&block.start].keys());
         }
 
-        let mut iter = data.instructions_spanning(<PIC17 as Arch>::Decoder::default(), block.start, block.end);
+        let mut iter = PIC17::instructions_spanning(data, block.start, block.end);
+//                println!("Block: {:#04x}", next);
+//                println!("{:#04x}", block.start);
         while let Some((address, instr)) = iter.next() {
             let mut instr_string = String::new();
             PIC17::render_frame(

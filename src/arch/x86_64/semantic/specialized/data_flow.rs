@@ -80,8 +80,8 @@ pub(crate) fn decompose_locations(instr: &Instruction) -> Vec<(Option<Location>,
             Operand::Nothing => {
                 vec![]
             }
-            op => {
-                panic!("unhandled write operand: {}", op);
+            other => {
+                panic!("unhandled operand type {:?}", other);
             }
         }
     }
@@ -160,8 +160,8 @@ pub(crate) fn decompose_locations(instr: &Instruction) -> Vec<(Option<Location>,
             Operand::Nothing => {
                 vec![]
             }
-            op => {
-                panic!("unhandled read operand: {}", op);
+            other => {
+                panic!("unhandled operand type {:?}", other);
             }
         }
     }
@@ -255,8 +255,8 @@ pub(crate) fn decompose_locations(instr: &Instruction) -> Vec<(Option<Location>,
             Operand::Nothing => {
                 vec![]
             }
-            op => {
-                panic!("unhandled readwrite operand: {}", op);
+            other => {
+                panic!("unhandled operand type {:?}", other);
             }
         }
     }
@@ -278,11 +278,8 @@ pub(crate) fn decompose_locations(instr: &Instruction) -> Vec<(Option<Location>,
         Opcode::CVTPS2PD |
         Opcode::LDDQU |
         Opcode::LEA |
-        Opcode::MOVSX_b |
-        Opcode::MOVSX_w |
-        Opcode::MOVZX_b |
-        Opcode::MOVZX_w |
         Opcode::MOVSX |
+        Opcode::MOVZX |
         Opcode::MOVSXD |
         Opcode::MOVAPS |
         Opcode::MOVUPS |
@@ -320,13 +317,18 @@ pub(crate) fn decompose_locations(instr: &Instruction) -> Vec<(Option<Location>,
             ]
         }
         Opcode::BT |
-        Opcode::BTS |
-        Opcode::BTR |
-        Opcode::BTC |
-        Opcode::BSR |
         Opcode::BSF |
         Opcode::TZCNT => {
             let mut locs = decompose_read(&instr.operand(0));
+            locs.append(&mut decompose_read(&instr.operand(1)));
+            locs.push((Some(Location::ZF), Direction::Write));
+            locs
+        }
+        Opcode::BTS |
+        Opcode::BTR |
+        Opcode::BTC |
+        Opcode::BSR => {
+            let mut locs = decompose_readwrite(&instr.operand(0));
             locs.append(&mut decompose_read(&instr.operand(1)));
             locs.push((Some(Location::ZF), Direction::Write));
             locs

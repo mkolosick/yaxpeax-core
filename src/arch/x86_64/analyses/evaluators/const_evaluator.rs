@@ -119,17 +119,17 @@ impl ConstEvaluator<x86_64, (), ConcreteDomain> for x86_64 {
                 ModifierExpression::Below(_) |
                 ModifierExpression::Above(_) => { }
                 ModifierExpression::Is(v) => {
-                    if let Some(loc) = location {
+                    if let Some(loc) = &location {
                         println!("Applying bound {:?} to location {:?}", expr, loc);
-                        println!("The corresponding def version is: {:?}", dfg.get_transient_def(from, to, loc).as_rc());
-                        dfg.get_transient_def(from, to, loc).update(Data::Concrete(*v, None));
+                        println!("The corresponding def version is: {:?}", dfg.get_transient_def(from, to, loc.clone()).as_rc());
+                        dfg.get_transient_def(from, to, loc.clone()).update(Data::Concrete(*v, None));
                     }
                 }
             }
         }
     }
 
-    fn evaluate_instruction<U: MemoryRange<<x86_64 as Arch>::Address>>(instr: &<x86_64 as Arch>::Instruction, addr: <x86_64 as Arch>::Address, dfg: &SSA<x86_64>, _contexts: &(), _data: &U) {
+    fn evaluate_instruction<U: MemoryRange<x86_64>>(instr: &<x86_64 as Arch>::Instruction, addr: <x86_64 as Arch>::Address, dfg: &SSA<x86_64>, _contexts: &(), _data: &U) {
         //TODO: handle prefixes like at all
         match instr.opcode() {
             Opcode::XOR => {
@@ -167,46 +167,65 @@ impl ConstEvaluator<x86_64, (), ConcreteDomain> for x86_64 {
                 }
             },
             Opcode::MOV => {
-                if let Operand::Register(l) = instr.operand(0) {
-                    let def_site = if l.class() == register_class::D {
+                println!("DOING MOV for {}", instr);
+                let def_site = if let Operand::Register(l) = instr.operand(0) {
+                    if l.class() == register_class::D {
                         // this assigns to Q instead of D
                         dfg.get_def(addr, Location::Register(RegSpec::q(l.num())))
                     } else {
                         dfg.get_def(addr, Location::Register(l))
-                    };
-
-                    match instr.operand(1) {
-                        Operand::Register(r) => {
-                            def_site.update(
-                                Data::Alias(dfg.get_use(addr, Location::Register(r)).as_rc())
-                            );
-                        },
-                        Operand::ImmediateI8(imm) => {
-                            def_site.update(Data::Concrete(imm as i64 as u64, None));
-                        }
-                        Operand::ImmediateU8(imm) => {
-                            def_site.update(Data::Concrete(imm as u64, None));
-                        }
-                        Operand::ImmediateI16(imm) => {
-                            def_site.update(Data::Concrete(imm as i64 as u64, None));
-                        }
-                        Operand::ImmediateU16(imm) => {
-                            def_site.update(Data::Concrete(imm as u64, None));
-                        }
-                        Operand::ImmediateI32(imm) => {
-                            def_site.update(Data::Concrete(imm as i64 as u64, None));
-                        }
-                        Operand::ImmediateU32(imm) => {
-                            def_site.update(Data::Concrete(imm as u64, None));
-                        }
-                        Operand::ImmediateI64(imm) => {
-                            def_site.update(Data::Concrete(imm as u64, None));
-                        }
-                        Operand::ImmediateU64(imm) => {
-                            def_site.update(Data::Concrete(imm, None));
-                        }
-                        _ => {}
                     }
+                } else {
+                    // memory operand of some kind
+                    if let Some(src) = crate::arch::x86_64::analyses::evaluators::symbolizer::referent(instr, &instr.operand(0), addr, dfg, _contexts) {
+                        use analyses::memory_layout::MemoryAccessBaseInference;
+                        use analyses::static_single_assignment::DFGLValue;
+                        use crate::arch::x86_64::analyses::data_flow::ANY;
+                        if let Some((base, addend)) = MemoryAccessBaseInference::infer_base_and_addend(&src) {
+                            if let Some(def) = dfg.try_get_def(addr, Location::MemoryLocation(ANY, 8 /* l.width() */, Some((Data::Expression(base), Data::Expression(addend))))) {
+                                DFGLValue { value: def }
+                            } else {
+                                return;
+                            }
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                };
+
+                match instr.operand(1) {
+                    Operand::Register(r) => {
+                        def_site.update(
+                            Data::Alias(dfg.get_use(addr, Location::Register(r)).as_rc())
+                        );
+                    },
+                    Operand::ImmediateI8(imm) => {
+                        def_site.update(Data::Concrete(imm as i64 as u64, None));
+                    }
+                    Operand::ImmediateU8(imm) => {
+                        def_site.update(Data::Concrete(imm as u64, None));
+                    }
+                    Operand::ImmediateI16(imm) => {
+                        def_site.update(Data::Concrete(imm as i64 as u64, None));
+                    }
+                    Operand::ImmediateU16(imm) => {
+                        def_site.update(Data::Concrete(imm as u64, None));
+                    }
+                    Operand::ImmediateI32(imm) => {
+                        def_site.update(Data::Concrete(imm as i64 as u64, None));
+                    }
+                    Operand::ImmediateU32(imm) => {
+                        def_site.update(Data::Concrete(imm as u64, None));
+                    }
+                    Operand::ImmediateI64(imm) => {
+                        def_site.update(Data::Concrete(imm as u64, None));
+                    }
+                    Operand::ImmediateU64(imm) => {
+                        def_site.update(Data::Concrete(imm, None));
+                    }
+                    _ => {}
                 }
             },
             Opcode::LEA => {

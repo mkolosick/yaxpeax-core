@@ -13,24 +13,28 @@
 
 use arch::Symbol;
 use arch::{AbiDefaults, FunctionAbiReference};
-use analyses::static_single_assignment::{DFGRef, SSAValues, Value};
+use analyses::static_single_assignment::{DFGRef, SSAValues};
+use analyses::static_single_assignment::{DataDisplay as SSADataDisplay};
 use data::types::{Typed, TypeSpec, TypeAtlas};
 use yaxpeax_x86::long_mode::{register_class, ConditionCode, RegSpec, Operand};
 use yaxpeax_x86::x86_64;
 
 use std::rc::Rc;
 use std::fmt;
-use std::cell::RefCell;
+// use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 
-use std::collections::HashMap;
+// use std::collections::HashMap;
 use analyses::static_single_assignment::HashedValue;
-use serialize::Memoable;
+// use serialize::Memoable;
 use serde::{Serialize, Deserialize};
 use serde::de::{self, Deserializer, Visitor, Unexpected};
 use serde::ser::{Serializer};
 
+use tracing::error;
+
 use data::{Direction, Disambiguator, ValueLocations};
+use data::LocationAliasDescriptions;
 use arch::x86_64::display::DataDisplay;
 use yaxpeax_arch::ColorSettings;
 
@@ -48,7 +52,7 @@ pub const FLAGS: [Location; 10] = [
 ];
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MemoryRegion(u16);
+pub struct MemoryRegion(pub u16);
 
 pub const ANY: MemoryRegion = MemoryRegion(0);
 pub const STACK: MemoryRegion = MemoryRegion(1);
@@ -66,12 +70,11 @@ impl fmt::Display for MemoryRegion {
     }
 }
 
-#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, Hash, Eq, PartialEq)]
 pub enum Location {
     Register(RegSpec),
     Memory(MemoryRegion),
-    MemoryLocation(MemoryRegion, u16, i32),
-    UnevalMem(Operand),
+    MemoryLocation(MemoryRegion, u8, Option<(Data, Data)>),
     // not modeling eflags' system bits ... yet?
     CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL,
     // necessary to have a location to write that is provably not an Operand variant.
@@ -99,6 +102,58 @@ impl Location {
     pub fn ecx() -> Self { Location::Register(RegSpec::ecx()) }
     pub fn edx() -> Self { Location::Register(RegSpec::edx()) }
     pub fn ebx() -> Self { Location::Register(RegSpec::ebx()) }
+}
+
+use analyses::static_single_assignment::{DFGRebase, SSA};
+use analyses::static_single_assignment::DefSource;
+impl DFGRebase<yaxpeax_x86::x86_64> for Data {
+    fn rebase_references(&self, old_dfg: &SSA<yaxpeax_x86::x86_64>, new_dfg: &SSA<yaxpeax_x86::x86_64>) -> Self {
+        match self {
+            Data::Expression(expr) => {
+                Data::Expression(expr.rebase_references(old_dfg, new_dfg))
+            },
+            Data::Alias(dfg_ref) => {
+                if !new_dfg.defs.contains_key(&HashedValue { value: Rc::clone(dfg_ref) }) {
+                    let (_old_ref_addr, old_ref_source) = old_dfg.get_def_site(Rc::clone(dfg_ref));
+                    // "External" might mean f.ex `rsp_input`.
+                    match old_ref_source {
+                        DefSource::External => {
+                            Data::Alias(Rc::clone(new_dfg.external_defs.get(&dfg_ref.borrow().location).expect("external def has matching new def")))
+                        }
+                        DefSource::Instruction => {
+//                            self.to_owned()
+                            panic!("instruction def source");
+                        }
+                        other => {
+                            panic!("unhandled def source: {:?}", other);
+                        }
+                    }
+                } else {
+                    Data::Alias(Rc::clone(dfg_ref))
+                }
+            },
+            Data::ValueSet(value_ranges) => Data::ValueSet(value_ranges.to_owned()),
+            other => other.to_owned(),
+        }
+    }
+}
+
+impl DFGRebase<yaxpeax_x86::x86_64> for Location {
+    fn rebase_references(&self, old_dfg: &SSA<yaxpeax_x86::x86_64>, new_dfg: &SSA<yaxpeax_x86::x86_64>) -> Self {
+        match self {
+            Location::MemoryLocation(region, size, Some((base, addend))) => {
+                let new_base = base.rebase_references(old_dfg, new_dfg);
+                let new_addend = addend.rebase_references(old_dfg, new_dfg);
+                // it doesn't actually matter if `new_base` and `new_addend` are the same as the
+                // pre-rebase forms. if they are, either `new_*` are correct here, or they're
+                // different and we want `new_` ones. we would check here if `rebase_references`
+                // returned an indicator of "this is now a different location", but that's left to
+                // callers for now.
+                Location::MemoryLocation(*region, *size, Some((new_base, new_addend)))
+            }
+            other => other.to_owned()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +201,8 @@ impl<'de> Visitor<'de> for LocationVisitor {
                 Ok(Location::Memory(MemoryRegion(memory)))
             },
             "M" => {
+                panic!("can't serialize or deserialize Location::MemoryLocation yet");
+                /*
                 let memstr = parts.next().ok_or(
                     E::invalid_length(1, &"expected memory region in serialized location")
                 )?;
@@ -164,6 +221,7 @@ impl<'de> Visitor<'de> for LocationVisitor {
                 let memory_addr: i32 = serde_json::from_str(szstr).unwrap();
                 check_end(4, parts)?;
                 Ok(Location::MemoryLocation(MemoryRegion(memory), memory_size, memory_addr))
+                */
             },
             "c" => { check_end(1, parts)?; Ok(Location::CF) }
             "p" => { check_end(1, parts)?; Ok(Location::PF) }
@@ -194,7 +252,9 @@ impl Serialize for Location {
                 // !!!
                 serialized_loc.push_str(&serde_json::to_string(&region.0).unwrap());
             }
-            Location::MemoryLocation(region, size, offset) => {
+            Location::MemoryLocation(_region, _size, _access_info) => {
+                panic!("can't serialize or deserialize Location::MemoryLocation yet");
+                /*
                 serialized_loc.push_str("M:");
 
                 // !!!
@@ -205,6 +265,7 @@ impl Serialize for Location {
                 serialized_loc.push_str(":");
                 // !!!
                 serialized_loc.push_str(&serde_json::to_string(offset).unwrap());
+                */
             },
             Location::UnevalMem(_) => todo!(),
             Location::CF => { serialized_loc.push_str("c"); }
@@ -241,8 +302,12 @@ impl fmt::Display for Location {
         match self {
             Location::Register(reg) => write!(f, "{}", reg),
             Location::Memory(region) => write!(f, "(mem:{})", region),
-            Location::MemoryLocation(mem, size, offset) => {
-                write!(f, "(mem:{} + {}):{}", mem, offset, size)
+            Location::MemoryLocation(mem, size, access_info) => {
+                if let Some((base, addend)) = access_info {
+                    write!(f, "(mem:{} + {} + {}):{}", mem, base, addend, size)
+                } else {
+                    write!(f, "(mem:{}):{}", mem, size)
+                }
             },
             Location::UnevalMem(op) => write!(f, "{:?}", op),
             Location::CF => write!(f, "cf"),
@@ -454,7 +519,18 @@ pub enum SymbolicExpression {
     Add(Box<SymbolicExpression>, u64),
     Deref(Box<SymbolicExpression>),
     Symbol(Symbol),
-    CopOut(String)
+    CopOut(String),
+
+    // `MemoryAccessBaseInference` can be impl'd for `Data`, where a `SymbolicExpression` is where
+    // all the good stuff comes in
+    /*
+    Const(u64),
+    Value(Data),
+    Add(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Sub(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Mul(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Div(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    */
 }
 
 #[ignore]
@@ -462,7 +538,7 @@ pub enum SymbolicExpression {
 fn test_expr_fields() {
     use data::types::KPCR;
     let type_atlas = &TypeAtlas::new();
-    let expr = SymbolicExpression::Opaque(TypeSpec::PointerTo(Box::new(TypeSpec::PointerTo(Box::new(TypeSpec::LayoutId(KPCR))))));
+    let expr = SymbolicExpression::Opaque(TypeSpec::PointerTo(Rc::new(TypeSpec::PointerTo(Rc::new(TypeSpec::LayoutId(KPCR))))));
     println!("expr: {}", expr.show(type_atlas));
     println!("  ty: {:?}", expr.type_of(type_atlas));
     let access = SymbolicExpression::Deref(Box::new(expr.clone()));
@@ -536,14 +612,15 @@ impl Typed for SymbolicExpression {
             SymbolicExpression::Opaque(spec) => spec.clone(),
             SymbolicExpression::Add(expr, offset) => {
                 if let Some(field) = type_atlas.get_field(&expr.type_of(type_atlas), *offset as u32) {
-                    TypeSpec::PointerTo(Box::new(field.type_of()))
+                    TypeSpec::PointerTo(Rc::new(field.type_of()))
                 } else {
                     TypeSpec::Unknown
                 }
             }
             SymbolicExpression::Deref(expr) => {
-                if let TypeSpec::PointerTo(ty) = expr.type_of(type_atlas) {
-                    *ty.to_owned()
+                if let TypeSpec::PointerTo(_ty) = expr.type_of(type_atlas) {
+                    todo!("type_of");
+                    // *ty.to_owned()
                 } else {
                     TypeSpec::Unknown
                 }
@@ -561,18 +638,18 @@ impl Typed for SymbolicExpression {
 // => mov rdx_1, [KPCR.field_7 + 0x48]
 // => mov rdx_1, KPCR.field_7.field_9
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum ValueRange {
     Between(Data, Data),
     Precisely(Data),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Data {
     Concrete(u64, Option<TypeSpec>),
     Str(String),
-    Expression(SymbolicExpression),
-    Alias(Rc<RefCell<Value<x86_64>>>),
+    Expression(Rc<crate::analyses::Item<crate::analyses::ValueOrImmediate<x86_64>>>),
+    Alias(DFGRef<x86_64>),
     // This is a disjunction of "ranges" that may be a range of a single element
     // eg this is a set of ranges/specific values
     //
@@ -586,23 +663,65 @@ pub enum Data {
     // Indeterminate,
 }
 
-impl Data {
-    pub fn display<'a, 'b>(&'a self, colors: Option<&'b ColorSettings>) -> DataDisplay<'a, 'b> {
-        DataDisplay {
-            data: self,
-            colors,
+impl crate::analyses::memory_layout::Underlying for Data {
+    type Arch = x86_64;
+
+    fn underlying(&self) -> Option<DFGRef<Self::Arch>> {
+        match self {
+            Data::Alias(alias) => {
+                let mut underlying = Rc::clone(alias);
+                loop {
+                    let next = if let Some(Data::Alias(inner)) = &underlying.borrow().data {
+                        Rc::clone(inner)
+                    } else {
+                        break;
+                    };
+                    underlying = next;
+                }
+                Some(underlying)
+            }
+            _ => None,
         }
     }
 
+    fn expression(&self) -> Option<Rc<crate::analyses::Item<crate::analyses::ValueOrImmediate<x86_64>>>> {
+        if let Data::Expression(expr) = self {
+            Some(Rc::clone(expr))
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for Data {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.display(true, None))
+    }
+}
+
+impl<'data, 'colors> crate::analyses::static_single_assignment::DataDisplay<'data, 'colors> for Data {
+    type Displayer = DataDisplay<'data, 'colors>;
+    fn display(&'data self, detailed: bool, colors: Option<&'colors ColorSettings>) -> Self::Displayer {
+        DataDisplay {
+            data: self,
+            detailed,
+            colors,
+        }
+    }
+}
+
+impl Data {
     pub fn underlying(&self) -> Option<Data> {
         let mut curr = self.to_owned();
-        while let Data::Alias(alias) = curr {
-            match alias.borrow().data.clone() {
+        while let Data::Alias(alias) = &curr {
+            let alias = Rc::clone(alias);
+            let referent = alias.borrow().data.clone();
+            match referent {
                 Some(aliased) => {
                     curr = aliased;
                 }
                 None => {
-                    return None;
+                    break;
                 }
             }
         }
@@ -639,7 +758,7 @@ impl Data {
                 Some(Data::ValueSet(new_values))
             },
             _ => {
-                tracing::debug!("adding {} and {}", DataDisplay { data: left, colors: None }, DataDisplay { data: right, colors: None });
+                println!("Adding {} and {}", left.display(false, None), right.display(false, None));
                 return None;
             }
         }
@@ -700,7 +819,7 @@ impl Typed for Data {
         match self {
             Data::Concrete(_, ref t) => t.to_owned().unwrap_or(TypeSpec::Bottom),
             Data::Str(_) => TypeSpec::Bottom,
-            Data::Expression(expr) => expr.type_of(type_atlas),
+            Data::Expression(expr) => expr.ty.as_ref().map(|x| x.clone()).unwrap_or(TypeSpec::Bottom),
             Data::Alias(ptr) => ptr.borrow().data.to_owned().map(|d| d.type_of(type_atlas)).unwrap_or(TypeSpec::Unknown),
             // TODO: technically not valid - we could see if there's a shared type among
             // all the elements of the value set.
@@ -709,6 +828,7 @@ impl Typed for Data {
     }
 }
 
+/*
 // TODO: update memo
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DataMemo {
@@ -828,6 +948,7 @@ impl Memoable for HashedValue<Rc<RefCell<Value<x86_64>>>> {
         }
     }
 }
+*/
 
 impl Hash for Data {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -937,20 +1058,212 @@ pub(crate) fn cond_to_flags(cond: ConditionCode) -> &'static [(Option<Location>,
 
 #[derive(Default)]
 pub struct NoDisambiguation { }
-impl Disambiguator<Location, (u8, u8)> for NoDisambiguation {
-    fn disambiguate(&mut self, _spec: (u8, u8)) -> Option<Location> {
+impl<T> Disambiguator<x86_64, T> for NoDisambiguation {
+    fn disambiguate(&self, _instr: &<x86_64 as crate::Arch>::Instruction, _loc: (Option<Location>, Direction), _spec: T) -> Option<Location> {
         None
     }
 }
 
-pub struct ContextualDisambiguation<'a> {
-    dfg: &'a crate::analyses::static_single_assignment::SSA<x86_64>,
+impl LocationAliasDescriptions<x86_64> for NoDisambiguation {
+    fn may_alias(&self, _left: &Location, _right: &Location) -> bool {
+        false
+    }
+
+    fn aliases_for(&self, loc: &Location) -> Vec<Location> {
+        loc.aliases_of()
+    }
 }
 
-impl <'a> Disambiguator<Location, (u8, u8)> for ContextualDisambiguation<'a> {
-    fn disambiguate(&mut self, _spec: (u8, u8)) -> Option<Location> {
+pub struct ContextualDisambiguation<'dfg, 'mem> {
+    pub dfg: &'dfg crate::analyses::static_single_assignment::SSA<x86_64>,
+    pub memory_layout: Option<&'mem crate::analyses::memory_layout::MemoryLayout<'dfg, x86_64>>,
+}
+
+impl <'dfg, 'mem> LocationAliasDescriptions<x86_64> for ContextualDisambiguation<'dfg, 'mem> {
+    fn may_alias(&self, left: &Location, right: &Location) -> bool {
+        match (left, right) {
+            (Location::MemoryLocation(_, _l_size, Some((l_base, l_addend))), Location::MemoryLocation(_, _r_size, Some((r_base, r_addend)))) => {
+                if let Some(memory_layout) = self.memory_layout {
+                    let segments = memory_layout.segments.borrow();
+
+                    use analyses::Expression;
+                    let l_segment = if let Data::Expression(base) = l_base {
+                        if let Expression::Value(v) = &base.value {
+                            segments.get(&v)
+                        } else {
+                            error!("l_base is a Data::Expression, but the expression is non-Value: {:?}", base.value);
+                            return true;
+                        }
+                    } else {
+                        error!("l_base is not a Data::Expression, but is assumed to always be an Expression");
+                        return true;
+                    };
+                    let r_segment = if let Data::Expression(base) = r_base {
+                        if let Expression::Value(v) = &base.value {
+                            segments.get(&v)
+                        } else {
+                            error!("r_base is a Data::Expression, but the expression is non-Value: {:?}", base.value);
+                            return true;
+                        }
+                    } else {
+                        error!("r_base is not a Data::Expression, but is assumed to always be an Expression");
+                        return true;
+                    };
+                    match (l_segment, r_segment) {
+                        (Some(l_segment), Some(r_segment)) => {
+                            // if one or both accesses are unknown, they may alias
+                            /*
+                            let _l_access = if let Some(access) = l_segment.borrow().get(l_addend) {
+                                access
+                            } else {
+                                return true;
+                            };
+                            let _r_access = if let Some(access) = r_segment.borrow().get(r_addend) {
+                                access
+                            } else {
+                                return true;
+                            };
+                            */
+
+                            if Rc::ptr_eq(l_segment, r_segment) {
+                                // the two segments are the same, then these only overlap if the
+                                // two accesses are known to be the same
+                                //
+                                // TODO: not entirely accurate. if l_access and r_access overlap
+                                // but are not identical, this incorrectly reports no alias. at
+                                // some point the following line should be uncomment-able:
+                                // ```
+                                // l_access.is_overlapping(r_access)
+                                // ```
+                                //
+                                // TODO: segments are the same, which means these would look up
+                                // the same MemoryRegion, but there's no Eq on MemoryRegion yet
+                                // and we can just use these directly. eventually,
+                                // `.is_overlapping` will handle cases where non-equal regions
+                                // do overlap a bit.
+                                l_addend == r_addend
+                            } else {
+                                // if the segments are known, but not known to be the same,
+                                // regardless of addends they may overlap - one may be a subset of
+                                // another, so different addends could select the same location.
+                                //
+                                // TODO: `noalias` assumption to optimistically conclude that some
+                                // regions still would not overlap? some operations are assumed to
+                                // return new non-aliasing memory (malloc, new, mmap,
+                                // NtAllocateVirtualMemory, and others..). this still needs to be
+                                // controllable because in circumstances like malloc corruption -
+                                // which yaxpeax may be used to reason about - these assumptions
+                                // certainly could be violated..
+                                true
+                            }
+                        }
+                        _ => {
+                            true
+                        }
+                    }
+                } else {
+                    // we have no memory layout information; pessimistically assume that any memory
+                    // accesses can alias.
+                    //
+                    // TODO: if both memory operands are constants we can still determine they
+                    // don't overlap. that circumstance is ... probably rare.
+                    true
+                }
+            }
+            (Location::MemoryLocation(_, _, _), Location::Memory(_)) |
+            (Location::Memory(_), Location::MemoryLocation(_, _, _)) |
+            (Location::Memory(_), Location::Memory(_)) => {
+                true
+            }
+            (l, r) => {
+                l.aliases_of().contains(r) || r.aliases_of().contains(l)
+            }
+        }
+    }
+
+    // given this `memory_layout` and `dfg`, what locations (including memory partitions) may
+    // overlap with `loc`?
+    fn aliases_for(&self, loc: &Location) -> Vec<Location> {
+        // TODO: (incorrectly) assert that there are no different aliasing relationships
+        loc.aliases_of()
+    }
+}
+
+impl <'dfg, 'mem> Disambiguator<x86_64, (<x86_64 as crate::Arch>::Address, u8, u8)> for ContextualDisambiguation<'dfg, 'mem> {
+    fn disambiguate(&self, instr: &<x86_64 as crate::Arch>::Instruction, loc: (Option<Location>, Direction), spec: (<x86_64 as crate::Arch>::Address, u8, u8)) -> Option<Location> {
         // figure out if the location is sp-relative or rip-relative
         // .. or, has a relocation?
+//        println!("so you'd like me to disambiguate {}, {:?}", instr, spec);
+        use analyses::DFG;
+        use analyses::IndirectQuery;
+        use arch::x86_64::semantic::DFGAccessExt;
+        if let Some(memory) = self.memory_layout {
+            if let Some(Location::Memory(ANY)) = loc.0 {
+                use yaxpeax_x86::long_mode::{Opcode, Operand};
+
+                let q = memory.query_at(spec.0);
+                let access = if spec.1 == 0 {
+                    match instr.opcode() {
+                        Opcode::RETURN => {
+                            q.effective_address(&Operand::RegDeref(RegSpec::rsp()))
+                        }
+                        Opcode::PUSH => {
+                            q.effective_address(&Operand::RegDeref(RegSpec::rsp()))
+                        }
+                        Opcode::POP => {
+                            q.effective_address(&Operand::RegDeref(RegSpec::rsp()))
+                        }
+                        _ => {
+                            tracing::error!("FIXME: bailing out for implied memory operand in {}", instr);
+                            // HACK: effective_address is not appropriate when *the operand to disambiguate
+                            // is implied*. this is the case for movs, cmps, push, and pop's memory
+                            // operands...
+                            return None;
+                        }
+                    }
+                } else {
+                    q.effective_address(&instr.operand(spec.1 - 1))
+                };
+                use analyses::memory_layout::MemoryAccessBaseInference;
+                use analyses::Expression;
+                if let Some((base, addend)) = MemoryAccessBaseInference::infer_base_and_addend(&access) {
+                    if base.value != Expression::Unknown && addend.value != Expression::Unknown {
+                        use analyses::IntoValueIndex;
+                        println!("base {}, addend {}, instr {}", base, addend, instr);
+                        let indirect = self.memory_layout.expect("mem layout").indirect_loc(spec.0, loc.0.unwrap());
+                        //println!("  {:?}", indirect);
+                        let size_hack = match instr.mem_size().and_then(|sz| sz.bytes_size()) {
+                            Some(sz) => sz as usize,
+                            None => {
+                                eprintln!("instruction '{}' at {:?} does not have a memory size even though it has a memory operand. this is yaxpeax-x86 bug. assuming 8 bytes.", instr, spec);
+                                8 as usize
+                            }
+                        };
+                        match loc.1 {
+                            // TODO: fix panic for non-const memory width accesses (like xsave etc)
+                            Direction::Read => {
+                                if indirect.try_get_load(access.width(size_hack)).is_some() {
+                                    println!("disambiguated {}, {:?} to {}+{}", instr, spec, base, addend);
+                                    return Some(Location::MemoryLocation(ANY, size_hack as u8, Some((Data::Expression(base), Data::Expression(addend)))));
+                                } else {
+                                    eprintln!("could not get load for access {} in instruction '{}' at {:?}", access.width(size_hack), instr, spec);
+                                }
+                            }
+                            Direction::Write => {
+                                if indirect.try_get_store(access.width(size_hack)).is_some() {
+                                    println!("disambiguated {}, {:?} to {}+{}", instr, spec, base, addend);
+                                    return Some(Location::MemoryLocation(ANY, size_hack as u8, Some((Data::Expression(base), Data::Expression(addend)))));
+                                } else {
+                                    eprintln!("could not get store for access {} in instruction '{}' at {:?}", access.width(size_hack), instr, spec);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("could not infer base/addend for {}, operand={}", instr, access);
+                }
+            }
+        }
         None
     }
 }

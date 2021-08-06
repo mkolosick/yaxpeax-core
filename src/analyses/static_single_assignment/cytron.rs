@@ -1,5 +1,4 @@
 use yaxpeax_arch::Arch;
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::cmp::Eq;
@@ -17,11 +16,14 @@ use memory::MemoryRange;
 
 use analyses::static_single_assignment::{HashedValue, DefSource, DFGRef, Value, SSA, SSAValues, PhiLocations};
 use analyses::static_single_assignment::data::PhiOp;
+use analyses::static_single_assignment::data::DFGRebase;
 use data::{AliasInfo, Direction, Disambiguator, LocIterator};
+use data::LocationAliasDescriptions;
+use data::ValueLocations;
 use data::modifier::ModifierCollection;
 use data::modifier;
 
-use arch::{AbiDefaults, FunctionImpl, FunctionQuery, InstructionSpan};
+use arch::{AbiDefaults, DecodeFrom, FunctionImpl, FunctionQuery, InstructionSpan};
 
 #[test]
 fn test_immediate_dominators_construction() {
@@ -104,35 +106,45 @@ pub fn compute_dominance_frontiers_from_idom<A>(graph: &GraphMap<A, (), petgraph
     dominance_frontiers
 }
 
-struct UseDefTracker<A: crate::data::ValueLocations> {
+struct UseDefTracker<'lad, A: crate::data::ValueLocations, LAD: LocationAliasDescriptions<A>> {
+    loc_descs: Option<&'lad LAD>,
     pub all_locations: HashSet<A::Location>,
     pub assignments: HashMap<A::Location, HashSet<A::Address>>,
     pub aliases: HashMap<A::Location, HashSet<A::Location>>,
 }
 
-impl <A: crate::data::ValueLocations> UseDefTracker<A> {
-    pub fn new() -> Self {
+impl <'lad, A: crate::data::ValueLocations, LAD: LocationAliasDescriptions<A>> UseDefTracker<'lad, A, LAD> {
+    pub fn new(loc_descs: Option<&'lad LAD>) -> Self {
         UseDefTracker {
+            loc_descs,
             all_locations: HashSet::new(),
             assignments: HashMap::new(),
             aliases: HashMap::new(),
         }
     }
 
-    pub fn track_use(&mut self, loc: A::Location) {
-        self.all_locations.insert(loc);
-        for alias in loc.aliases_of() {
-            self.track_alias(alias, loc);
+    fn track_use(&mut self, loc: A::Location) {
+        self.all_locations.insert(loc.clone());
+        if let Some(loc_descs) = self.loc_descs {
+            // NOTE: `loc_descs.aliases_for(loc)` should be a superset of `loc.aliases_of()`
+            // TODO: verify this with asserts.
+            for alias in loc_descs.aliases_for(&loc) {
+                self.track_alias(alias, loc.clone());
+            }
+        } else {
+            for alias in loc.aliases_of() {
+                self.track_alias(alias, loc.clone());
+            }
         }
     }
 
-    pub fn track_def(&mut self, loc: A::Location, addr: A::Address) {
-        self.assignments.entry(loc).or_insert_with(|| HashSet::new()).insert(addr);
+    fn track_def(&mut self, loc: A::Location, addr: A::Address) {
+        self.assignments.entry(loc.clone()).or_insert_with(|| HashSet::new()).insert(addr);
         self.track_use(loc);
     }
 
-    pub fn track_alias(&mut self, alias: A::Location, loc: A::Location) {
-        self.all_locations.insert(alias);
+    fn track_alias(&mut self, alias: A::Location, loc: A::Location) {
+        self.all_locations.insert(alias.clone());
         self.aliases.entry(alias).or_insert_with(|| HashSet::new())
             .insert(loc);
     }
@@ -169,15 +181,15 @@ struct ValueAllocator<A: Arch + SSAValues> {
 }
 
 impl<A: Arch + SSAValues> ValueAllocator<A> {
-    fn from_use_tracker(tracker: UseDefTracker<A>) -> Self {
+    fn from_use_tracker<'lad, LAD: LocationAliasDescriptions<A>>(tracker: UseDefTracker<'lad, A, LAD>) -> Self {
         let mut allocator = ValueAllocator {
             C: HashMap::new(),
             S: HashMap::new(),
         };
 
         for loc in tracker.all_locations {
-            allocator.C.insert(loc, 0);
-            allocator.S.insert(loc, vec![Rc::new(RefCell::new(Value::new(loc, None)))]);
+            allocator.C.insert(loc.clone(), 0);
+            allocator.S.insert(loc.clone(), vec![Rc::new(RefCell::new(Value::new(loc.clone(), None)))]);
         }
 
         allocator
@@ -189,7 +201,7 @@ impl<A: Arch + SSAValues> ValueAllocator<A> {
 
     fn new_value(&mut self, loc: A::Location) -> Value<A> {
         use std::collections::hash_map::Entry;
-        if let Entry::Occupied(mut e) = self.C.entry(loc) {
+        if let Entry::Occupied(mut e) = self.C.entry(loc.clone()) {
             let i = *e.get();
             *e.get_mut() += 1;
             Value::new(loc, Some(i))
@@ -203,23 +215,23 @@ impl<A: Arch + SSAValues> ValueAllocator<A> {
     }
 
     pub fn alloc_value(&mut self, loc: A::Location) -> Rc<RefCell<Value<A>>> {
-        let new_ref = Rc::new(RefCell::new(self.new_value(loc)));
+        let new_ref = Rc::new(RefCell::new(self.new_value(loc.clone())));
         self.S.get_mut(&loc).expect("S should have entries for all locations.").push(Rc::clone(&new_ref));
         new_ref
     }
     pub fn alloc_value_with<F: FnMut(Value<A>) -> Rc<RefCell<Value<A>>>>(&mut self, loc: A::Location, mut f: F) -> Rc<RefCell<Value<A>>> {
-        let new_ref = f(self.new_value(loc));
+        let new_ref = f(self.new_value(loc.clone()));
         self.S.get_mut(&loc).expect("S should have entries for all locations.").push(Rc::clone(&new_ref));
         new_ref
     }
 
-    pub fn current(&self, loc: A::Location) -> &Rc<RefCell<Value<A>>> {
-        let stack = &self.S[&loc];
+    pub fn current(&self, loc: &A::Location) -> &Rc<RefCell<Value<A>>> {
+        let stack = &self.S[loc];
         &stack[stack.len() - 1]
     }
 
-    pub fn previous(&self, loc: A::Location) -> &Rc<RefCell<Value<A>>> {
-        let stack = &self.S[&loc];
+    pub fn previous(&self, loc: &A::Location) -> &Rc<RefCell<Value<A>>> {
+        let stack = &self.S[loc];
         &stack[stack.len() - 2]
     }
 
@@ -227,28 +239,43 @@ impl<A: Arch + SSAValues> ValueAllocator<A> {
         let mut writelog: HashSet<A::Location> = HashSet::new();
         for (maybeloc, direction) in items {
             if let Some(loc) = maybeloc {
-                for loc in std::iter::once(loc).chain(loc.aliases_of().into_iter()) {
+                // TODO: use a `LocationAliasDescriptions` here in place of `loc.aliases_of()`
+                for loc in std::iter::once(loc.clone()).chain(loc.aliases_of().into_iter()) {
                     match direction {
                         Direction::Read => {
                             let value = if writelog.contains(&loc) {
-                                self.previous(loc)
+                                self.previous(&loc)
                             } else {
-                                self.current(loc)
+                                self.current(&loc)
                             };
                             value.borrow_mut().used = true;
                             insert_entry(ssa, (loc, Direction::Read), Rc::clone(value));
                         },
                         Direction::Write => {
+                            // treat writes also as reads of the location they write. this is to
+                            // support linking defs with prior values the def overwrites.
+                            // NOTE: do *not* call this a use of the value, in case this would be
+                            // the only use of a value (a clobber of a caller-save register, for
+                            // example). this possibly should be tracked as a `kill` of the value,
+                            // but yaxpeax doesn't have a concept of kills yet.
+                            let value = if writelog.contains(&loc) {
+                                self.previous(&loc)
+                            } else {
+                                self.current(&loc)
+                            };
+                            insert_entry(ssa, (loc.clone(), Direction::Read), Rc::clone(value));
+
+                            // original write logic.
                             if writelog.contains(&loc) {
                                 continue;
                             } else {
                                 writelog.insert(loc.clone());
                             }
-                            let new_value = self.alloc_value(loc);
+                            let new_value = self.alloc_value(loc.clone());
                             ssa.defs.insert(HashedValue {
                                 value: Rc::clone(&new_value)
                             }, def_source);
-                            insert_entry(ssa, (loc, Direction::Write), new_value);
+                            insert_entry(ssa, (loc.clone(), Direction::Write), new_value);
                             // for very assignment-heavy blocks maybe there's a good way to summarize multiple of the same location being assigned
                             // eg is it faster to store this and pop it back or is it faster to just
                             // decode again..?
@@ -271,13 +298,110 @@ impl<A: Arch + SSAValues> ValueAllocator<A> {
     }
 }
 
-pub fn generate_ssa<
+/*
+ * need a variant of `generate_ssa` for "generate refinement of old dfg, then translate expressions
+ * referencing old dfg values"
+ *
+ * this is because expressions describing memory regions can (and should!) reference ssa values as
+ * part of their expressions. so once a new dfg is generated from refinements drived from the old
+ * dfg, those refinements need to instead be phrased in terms of values in the new dfg that will be
+ * returned.
+ *
+ * in general, the values and data in a dfg should be self-referential (otherwise dfg updates and
+ * refinements could cause broken and spooky action!)
+ */
+pub fn generate_refined_ssa<
     'functions,
-    A: SSAValues,
-    M: MemoryRange<A::Address>,
+    'disambiguator,
+    'dfg,
+    'location_disambiguator,
+    A: SSAValues + for<'mem> DecodeFrom<M>,
+    M: MemoryRange<A> + ?Sized,
     U: ModifierCollection<A>,
     LocSpec,
-    Disam: Disambiguator<A::Location, LocSpec>,
+    Disam: Disambiguator<A, LocSpec> + LocationAliasDescriptions<A>,
+    F: FunctionQuery<A::Address, Function=FunctionImpl<A::Location>>,
+>(
+    data: &M,
+    entry: A::Address,
+    basic_blocks: &ControlFlowGraph<A::Address>,
+    cfg: &GraphMap<A::Address, (), petgraph::Directed>,
+    old_dfg: &'dfg SSA<A>,
+    value_modifiers: &U,
+    disambiguator: &'disambiguator Disam,
+    functions: &'functions F,
+) -> SSA<A> where
+    A::Location: 'static + AbiDefaults,
+    for<'a> &'a <A as Arch>::Instruction: LocIterator<'disambiguator, 'functions, A, A::Location, Disam, F, Item=(Option<A::Location>, Direction), LocSpec=LocSpec>,
+    <A as ValueLocations>::Location: DFGRebase<A>,
+{
+    let mut new_dfg = generate_ssa(data, entry, basic_blocks, cfg, value_modifiers, disambiguator, functions);
+
+    // iterate `new_dfg` values and replace any `DFGRef` in `old_dfg` with corresponding `DFGRef` in `new_dfg`.
+    println!("{:?}", &new_dfg.instruction_values);
+    let mut loc_updates = HashMap::new();
+    for (addr, v) in &new_dfg.instruction_values {
+        println!("{:?}", addr);
+        for ((loc, dir), dfg_ref) in v {
+            println!("location for {:?}, {:?}", loc, dir);
+            if let Some(old_value) = old_dfg.get_value(*addr, loc.to_owned(), *dir) {
+                if dfg_ref.borrow().location != old_value.borrow().location || dfg_ref.borrow().version != old_value.borrow().version {
+                    println!("{} -> {}", old_value.borrow(), dfg_ref.borrow());
+                } else {
+                    println!("{} == {}", old_value.borrow(), dfg_ref.borrow());
+                }
+            } else {
+                // okay this is some kinda location that didn't exist before. maybe this is a new
+                // memory access expression. iterate the fields and try to update those to
+                // values in this dfg...?
+                let new_loc = loc.rebase_references(old_dfg, &new_dfg);
+                if &new_loc != loc {
+                    loc_updates.insert(loc.clone(), new_loc);
+                }
+            }
+        }
+        // every value has a location, 
+    }
+    println!("{} locations to update", loc_updates.len());
+    for (k, v) in loc_updates.iter() {
+        println!("  - {:?} => {:?}", k, v);
+    }
+
+    for (_addr, values) in new_dfg.instruction_values.iter_mut() {
+        let mut new_values = values.clone();
+        for ((loc, dir), value) in values.iter() {
+            if loc_updates.contains_key(loc) {
+                new_values.remove(&(loc.to_owned(), *dir));
+                new_values.insert((loc_updates[loc].to_owned(), *dir), Rc::clone(value));
+                value.borrow_mut().location = loc_updates[loc].to_owned();
+            }
+        }
+        *values = new_values;
+    }
+
+    if true {
+        println!("instruction values {:?}", &new_dfg.instruction_values);
+        println!("modifier values {:?}", &new_dfg.modifier_values);
+        println!("defs {:?}", &new_dfg.defs);
+//        println!("phi {:?}", &new_dfg.phi);
+        /*
+        for v in new_dfg.values() {
+            assert!(A::Data::test_integrity(v, &new_dfg))
+        }
+        */
+    }
+
+    new_dfg
+}
+
+pub fn generate_ssa<
+    'functions,
+    'disambiguator,
+    A: SSAValues + for<'mem> DecodeFrom<M>,
+    M: MemoryRange<A> + ?Sized,
+    U: ModifierCollection<A>,
+    LocSpec,
+    Disam: Disambiguator<A, LocSpec> + LocationAliasDescriptions<A>,
     F: FunctionQuery<A::Address, Function=FunctionImpl<A::Location>>,
 >(
     data: &M,
@@ -285,11 +409,11 @@ pub fn generate_ssa<
     basic_blocks: &ControlFlowGraph<A::Address>,
     cfg: &GraphMap<A::Address, (), petgraph::Directed>,
     value_modifiers: &U,
-    disambiguator: &mut Disam,
+    disambiguator: &'disambiguator Disam,
     functions: &'functions F,
 ) -> SSA<A> where
     A::Location: 'static + AbiDefaults,
-    for<'a, 'disam, 'fns> &'a <A as Arch>::Instruction: LocIterator<'disam, 'fns, A::Address, A::Location, Disam, F, Item=(Option<A::Location>, Direction), LocSpec=LocSpec>
+    for<'a> &'a <A as Arch>::Instruction: LocIterator<'disambiguator, 'functions, A, A::Location, Disam, F, Item=(Option<A::Location>, Direction), LocSpec=LocSpec>,
 {
     let idom = petgraph::algo::dominators::simple_fast(&cfg, entry);
 
@@ -297,7 +421,7 @@ pub fn generate_ssa<
 
     // extract out dominance frontiers .... one day...
 
-    let mut use_tracker = UseDefTracker::<A>::new();
+    let mut use_tracker = UseDefTracker::<A, _>::new(Some(disambiguator));
 
     let mut has_already: HashMap<A::Address, u32> = HashMap::new();
     let mut work: HashMap<A::Address, u32> = HashMap::new();
@@ -307,7 +431,7 @@ pub fn generate_ssa<
         let block = basic_blocks.get_block(k);
         has_already.insert(k, 0);
         work.insert(k, 0);
-        let mut iter = data.instructions_spanning(A::Decoder::default(), block.start, block.end);
+        let mut iter = A::instructions_spanning(data, block.start, block.end);
         while let Some((address, instr)) = iter.next() {
             for (maybeloc, direction) in value_modifiers.before(address).iter().cloned().chain(instr.iter_locs(address, disambiguator, functions)).chain(value_modifiers.after(address).iter().cloned()) {
                 use_tracker.track(block.start, maybeloc, direction);
@@ -342,7 +466,9 @@ pub fn generate_ssa<
         modifier_values: HashMap::new(),
         control_dependent_values: HashMap::new(),
         defs: HashMap::new(),
-        phi: HashMap::new()
+        phi: HashMap::new(),
+        indirect_values: HashMap::new(),
+        external_defs: HashMap::new(),
     };
 
     let mut iter_count = 0;
@@ -371,9 +497,9 @@ pub fn generate_ssa<
                     if has_already[Y] < iter_count {
                         // versioned at 0xffffffff to indicate a specialness to them.
                         // These should never be present after search().
-                        let new_value = Rc::new(RefCell::new(Value::new(*loc, Some(0xffffffff))));
+                        let new_value = Rc::new(RefCell::new(Value::new(loc.clone(), Some(0xffffffff))));
                         ssa.phi.entry(*Y).or_insert_with(|| HashMap::new())
-                            .insert(*loc, PhiOp { out: new_value, ins: vec![] });
+                            .insert(loc.clone(), PhiOp { out: new_value, ins: vec![] });
                         // TODO: phi nodes are assignments too! this is definitely a bug.
                         has_already.insert(*Y, iter_count);
                         if work[Y] < iter_count {
@@ -402,11 +528,12 @@ pub fn generate_ssa<
     #[allow(non_snake_case)]
     fn search<
         'functions,
-        A: Arch + SSAValues,
-        M: MemoryRange<A::Address>,
+        'disambiguator,
+        A: Arch + SSAValues + for<'mem> DecodeFrom<M>,
+        M: MemoryRange<A> + ?Sized,
         U: ModifierCollection<A>,
         LocSpec,
-        Disam: Disambiguator<A::Location, LocSpec>,
+        Disam: Disambiguator<A, LocSpec>,
         F: FunctionQuery<A::Address, Function=FunctionImpl<A::Location>>,
     >(
         data: &M,
@@ -417,11 +544,11 @@ pub fn generate_ssa<
         idom: &petgraph::algo::dominators::Dominators<A::Address>,
         value_allocator: &mut ValueAllocator<A>,
         value_modifiers: &U,
-        disambiguator: &mut Disam,
+        disambiguator: &'disambiguator Disam,
         functions: &'functions F,
     ) where
         A::Location: 'static + AbiDefaults,
-        for<'a, 'disam, 'fns> &'a <A as Arch>::Instruction: LocIterator<'disam, 'fns, A::Address, A::Location, Disam, F, Item=(Option<A::Location>, Direction), LocSpec=LocSpec>
+        for<'a> &'a <A as Arch>::Instruction: LocIterator<'disambiguator, 'functions, A, A::Location, Disam, F, Item=(Option<A::Location>, Direction), LocSpec=LocSpec>
     {
         let mut assignments: Vec<A::Location> = Vec::new();
         // for each statement in block {
@@ -429,7 +556,7 @@ pub fn generate_ssa<
         if let Some(phis) = ssa.phi.get(&block.start) {
             for (loc, _data) in phis {
                 // these are very clear reads vs assignments:
-                let phi_dest = value_allocator.alloc_value_with(*loc, |value| {
+                let phi_dest = value_allocator.alloc_value_with(loc.clone(), |value| {
                     let phi_dest = Rc::clone(&ssa.phi[&block.start][loc].out);
                     phi_dest.replace(value);
                     phi_dest
@@ -440,11 +567,11 @@ pub fn generate_ssa<
                 // for very assignment-heavy blocks maybe there's a good way to summarize multiple of the same location being assigned
                 // eg is it faster to store this and pop it back or is it faster to just
                 // decode again..?
-                assignments.push(*loc); // ???
+                assignments.push(loc.clone()); // ???
             }
         }
 
-        let mut iter = data.instructions_spanning(A::Decoder::default(), block.start, block.end);
+        let mut iter = A::instructions_spanning(data, block.start, block.end);
         while let Some((address, instr)) = iter.next() {
             let before_fn = |ssa: &mut SSA<A>, pos, value| {
                 ssa.modifier_values.entry((address, modifier::Precedence::Before)).or_insert_with(|| HashMap::new()).insert(pos, value);
@@ -487,7 +614,7 @@ pub fn generate_ssa<
                 for (loc, phi_op) in block_phis.iter_mut() {
 //                    phi.operands[j] = .. /* value for S[V] */
 //                    // not quite perfect, but good enough
-                    phi_op.ins.push(Rc::clone(value_allocator.current(*loc)));
+                    phi_op.ins.push(Rc::clone(value_allocator.current(loc)));
                 }
             }
         }
@@ -508,7 +635,7 @@ pub fn generate_ssa<
                                 // being on the relevant edge of `control_dependent_values`,
                                 // so we have to inform the allocator of these new transient
                                 // values.
-                                value_allocator.track_external(*loc, Rc::clone(value));
+                                value_allocator.track_external(loc.clone(), Rc::clone(value));
                             }
                         }
                     }
@@ -530,7 +657,7 @@ pub fn generate_ssa<
                     if let Some(adjustments) = ssa.control_dependent_values.get(&block.start).and_then(|map| map.get(&u)) {
                         for ((loc, direction), _value) in adjustments {
                             if *direction == Direction::Write {
-                                value_allocator.free(*loc);
+                                value_allocator.free(loc.clone());
                             }
                         }
                     }

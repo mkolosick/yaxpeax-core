@@ -5,12 +5,18 @@ use analyses::control_flow;
 use analyses::Value;
 use data::ValueLocations;
 use analyses::control_flow::ControlFlowAnalysis;
+use analyses::OpaqueIndirection;
 
 use arch::x86_64::analyses::data_flow::Location;
 use analyses::DFG;
 
-impl DFG<control_flow::Effect<<x86_64 as Arch>::Address>, x86_64> for ControlFlowAnalysis<<x86_64 as Arch>::Address> {
-    fn read_loc(&self, loc: <x86_64 as ValueLocations>::Location) -> control_flow::Effect<<x86_64 as Arch>::Address> {
+impl DFG<control_flow::Effect<<x86_64 as Arch>::Address>, x86_64, ()> for ControlFlowAnalysis<<x86_64 as Arch>::Address> {
+    type Indirect = OpaqueIndirection<control_flow::Effect<<x86_64 as Arch>::Address>>;
+
+    fn indirect_loc(&self, _when: (), _loc: <x86_64 as ValueLocations>::Location) -> OpaqueIndirection<control_flow::Effect<<x86_64 as Arch>::Address>> {
+        OpaqueIndirection::inst()
+    }
+    fn read_loc(&self, _when: (), loc: <x86_64 as ValueLocations>::Location) -> control_flow::Effect<<x86_64 as Arch>::Address> {
         if loc == Location::RIP {
             self.effect.clone()
         } else if let Location::Memory(_) = loc {
@@ -20,7 +26,7 @@ impl DFG<control_flow::Effect<<x86_64 as Arch>::Address>, x86_64> for ControlFlo
         }
     }
 
-    fn write_loc(&mut self, loc: <x86_64 as ValueLocations>::Location, value: control_flow::Effect<<x86_64 as Arch>::Address>) {
+    fn write_loc(&mut self, _when: (), loc: <x86_64 as ValueLocations>::Location, value: control_flow::Effect<<x86_64 as Arch>::Address>) {
         if loc == Location::RIP {
             self.effect = value;
         } else {
@@ -53,21 +59,27 @@ impl_control_flow!(
 #[test]
 fn test_x86_determinant() {
     use yaxpeax_arch::Decoder;
+    use memory::MemoryRange;
+    use memory::repr::ReadCursor;
     use analyses::control_flow::Determinant;
-    let decoder = <x86_64 as Arch>::Decoder::default();
+    fn decode(data: &[u8]) -> <x86_64 as Arch>::Instruction {
+        let decoder = <x86_64 as Arch>::Decoder::default();
+        let cursor: ReadCursor<x86_64, [u8]> = data.range(0..(data.len() as u64)).unwrap();
+        decoder.decode(&mut cursor.to_reader()).unwrap()
+    }
     // call 0x1234567
-    let call = decoder.decode([0xe8, 0x78, 0x56, 0x34, 0x12].iter().cloned()).unwrap();
+    let call = decode(&[0xe8, 0x78, 0x56, 0x34, 0x12][..]);
     assert_eq!(call.control_flow(Option::<&()>::None), control_flow::Effect::cont());
     // jmp 0x1234567
-    let jmp = decoder.decode([0xe9, 0x78, 0x56, 0x34, 0x12].iter().cloned()).unwrap();
+    let jmp = decode(&[0xe9, 0x78, 0x56, 0x34, 0x12][..]);
     assert_eq!(jmp.control_flow(Option::<&()>::None), control_flow::Effect::stop_and(
         control_flow::Target::Relative(AddressDiff::from_const(0x12345678))
     ));
     // ret
-    let ret = decoder.decode([0xc3].iter().cloned()).unwrap();
+    let ret = decode(&[0xc3][..]);
     assert_eq!(ret.control_flow(Option::<&()>::None), control_flow::Effect::stop());
     // jl 0x14
-    let jl = decoder.decode([0x7c, 0x14].iter().cloned()).unwrap();
+    let jl = decode(&[0x7c, 0x14][..]);
     assert_eq!(jl.control_flow(Option::<&()>::None), control_flow::Effect::cont_and(
         control_flow::Target::Relative(AddressDiff::from_const(0x14))
     ));

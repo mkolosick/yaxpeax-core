@@ -2,8 +2,10 @@ use yaxpeax_arch::Arch;
 use yaxpeax_arch::AddressBase;
 use yaxpeax_arch::AddressDisplay;
 use yaxpeax_arch::LengthedInstruction;
+use arch::DecodeFrom;
 use arch::InstructionSpan;
 use arch::display::BaseDisplay;
+use analyses::static_single_assignment::DataDisplay;
 use analyses::static_single_assignment::SSAValues;
 use analyses::static_single_assignment::SSA;
 use analyses::control_flow::ControlFlowGraph;
@@ -20,8 +22,6 @@ use std::fmt;
 use std::fmt::Write;
 use std::marker::PhantomData;
 
-use num_traits::Zero;
-
 /// This view in particular takes optionally-present data flow information, which ends up
 /// restricting the usefulness of this struct to architectures that have SSA information defined.
 /// a handy TODO: here is to either figure out how to have a default Location that specifies no
@@ -35,7 +35,7 @@ pub struct FunctionView<
     F: FunctionRepr,
     Context: FunctionQuery<A::Address>,
     A: Arch + BaseDisplay<F, Context> + SSAValues,
-    M: MemoryRepr<A::Address> + MemoryRange<A::Address>
+    M: MemoryRepr<A> + MemoryRange<A>
 > {
     pub _function_type: PhantomData<F>,
     pub data: &'a M,
@@ -72,11 +72,17 @@ pub trait FunctionInstructionDisplay<A: Arch + SSAValues, Context: SymbolQuery<A
 
 impl <
     'a, 'c, 'd, 'e,
+    A,
     F: FunctionRepr,
     Context: FunctionQuery<A::Address> + SymbolQuery<A::Address>,
-    A: Arch + BaseDisplay<F, Context> + SSAValues,
-    M: MemoryRepr<A::Address> + MemoryRange<A::Address>
-> FunctionDisplay<A> for FunctionView<'a, 'c, 'd, 'e, F, Context, A, M> where A: FunctionInstructionDisplay<A, Context>  {
+    M: MemoryRepr<A> + MemoryRange<A>
+> FunctionDisplay<A> for FunctionView<'a, 'c, 'd, 'e, F, Context, A, M> where
+    A: Arch +
+      SSAValues +
+      FunctionInstructionDisplay<A, Context> +
+      DecodeFrom<M> +
+      BaseDisplay<F, Context>,
+{
     fn entrypoint(&self) -> A::Address {
         self.fn_graph.entrypoint
     }
@@ -110,9 +116,11 @@ impl <
             let block = self.fn_graph.get_block(*blockaddr);
 
             // hack to avoid looking at the "basic block" over [0, ... first real basic block)
-            if block.start == A::Address::zero() { continue; }
+            // shouldn't be necessary anymore here since `fn_graph` is by definition blocks only in
+            // this function?
+            // if block.start == A::Address::zero() { continue; }
 
-            let mut iter = self.data.instructions_spanning(A::Decoder::default(), block.start, block.end);
+            let mut iter = A::instructions_spanning(self.data, block.start, block.end);
 
             if let Some(ssa) = self.ssa {
                 let start_ok = if let Some(start) = start {
@@ -135,11 +143,11 @@ impl <
                             for ((_loc, dir), value) in modifications.iter() {
                                 match dir {
                                     Direction::Read => {
-                                        strings.push(format!("read: {}", value.borrow().display()));
+                                        strings.push(format!("read: {}", value.borrow().display(false, None)));
                                         strings.push(format!("  via edge {} -> {}", source.show(), block.start.show()));
                                     }
                                     Direction::Write => {
-                                        strings.push(format!("write: {}", value.borrow().display()));
+                                        strings.push(format!("write: {}", value.borrow().display(false, None)));
                                         strings.push(format!("  via edge {} -> {}", source.show(), block.start.show()));
                                     }
                                 }
@@ -154,16 +162,16 @@ impl <
                         for (_, phi_op) in phis.iter() {
                             let out = phi_op.out.borrow();
                             if !out.used {
-                                hiddens.push(out.location);
+                                hiddens.push(out.location.clone());
                                 continue;
                             }
-                            let mut phi_line = format!("{} {} <- phi(", frame, phi_op.out.borrow().display());
+                            let mut phi_line = format!("{} {} <- phi(", frame, phi_op.out.borrow().display(false, None));
                             let mut in_iter = phi_op.ins.iter();
                             if let Some(phi_in) = in_iter.next() {
-                                write!(phi_line, "{}", phi_in.borrow().display()).unwrap();
+                                write!(phi_line, "{}", phi_in.borrow().display(false, None)).unwrap();
                             }
                             while let Some(phi_in) = in_iter.next() {
-                                write!(phi_line, ", {}", phi_in.borrow().display()).unwrap();
+                                write!(phi_line, ", {}", phi_in.borrow().display(false, None)).unwrap();
                             }
                             phi_line.push(')');
                             strings.push(phi_line);
@@ -208,7 +216,7 @@ impl <
                     write!(instr_string, "{}", termion::style::Invert).unwrap();
                 }
                 let highlights: Vec<(A::Location, Direction)> = self.highlight_locs.iter().filter_map(|(highlight_addr, loc, dir)| {
-                    Some((*loc, *dir)).filter(|_| highlight_addr == &address)
+                    Some((loc.clone(), *dir)).filter(|_| highlight_addr == &address)
                 }).collect();
                 if highlights.len() == 0 {
                     A::display_instruction_in_function(

@@ -10,10 +10,12 @@ use serialize::Memoable;
 use num_traits::Zero;
 
 use yaxpeax_arch::{AddressDiff, Arch};
+use yaxpeax_arch::Decoder;
 use yaxpeax_msp430::{Opcode, Operand, MSP430};
 use ContextRead;
 use ContextWrite;
 
+use arch::DecodeFrom;
 use arch::{Function, Symbol, SymbolQuery};
 use arch::FunctionQuery;
 use arch::CommentQuery;
@@ -22,6 +24,19 @@ use analyses::control_flow;
 use analyses::static_single_assignment::SSA;
 use analyses::static_single_assignment::{DFGRef, HashedValue, Value};
 use analyses::xrefs;
+use memory::MemoryRepr;
+use memory::repr::ReadCursor;
+
+impl<M: MemoryRepr<Self> + ?Sized> DecodeFrom<M> for MSP430 {
+    fn decode_with_decoder_into<'mem>(
+        decoder: &Self::Decoder,
+        data: &ReadCursor<'mem, MSP430, M>,
+        instr: &mut Self::Instruction
+    ) -> Result<(), Self::DecodeError> {
+        let mut reader = data.to_reader();
+        decoder.decode_into(instr, &mut reader)
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct MSP430Data {
@@ -364,9 +379,29 @@ impl Memoable for HashedValue<DFGRef<MSP430>> {
     }
 }
 
+use data::types::{Typed, TypeAtlas, TypeSpec};
+impl Typed for Data {
+    fn type_of(&self, _: &TypeAtlas) -> TypeSpec {
+        TypeSpec::Unknown
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Data {
+    Constant(u8)
+}
+
 use analyses::static_single_assignment::SSAValues;
 impl SSAValues for MSP430 {
-    type Data = u8;
+    type Data = Data;
+}
+
+use crate::ColorSettings;
+impl<'data, 'colors> crate::analyses::static_single_assignment::DataDisplay<'data, 'colors> for Data {
+    type Displayer = &'static str;
+    fn display(&'data self, detailed: bool, colors: Option<&'colors ColorSettings>) -> &'static str {
+        unimplemented!()
+    }
 }
 
 use data::ValueLocations;

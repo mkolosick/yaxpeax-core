@@ -69,7 +69,7 @@ pub struct InstructionContext<'a, 'b, 'c, 'd, 'e, Context: AddressNamer<<ARMv8 a
     _highlight: &'e Highlighter,
 }
 
-impl <'a, T: std::fmt::Write, C: fmt::Display, Y: YaxColors<C>> ShowContextual<u64, DisplayCtx<'a>, C, T, Y> for Instruction {
+impl <'a, T: std::fmt::Write, Y: YaxColors> ShowContextual<u64, DisplayCtx<'a>, T, Y> for Instruction {
     fn contextualize(&self, colors: &Y, _address: u64, _context: Option<&DisplayCtx<'a>>, out: &mut T) -> std::fmt::Result {
         self.contextualize(colors, _address, Some(&yaxpeax_arm::armv8::a64::NoContext), out)
     }
@@ -85,13 +85,13 @@ impl <
     }
 }
 
-pub fn show_instruction<M: MemoryRange<<ARMv8 as Arch>::Address>>(
+pub fn show_instruction<M: MemoryRange<ARMv8>>(
     data: &M,
     ctx: &MergedContextTable,
     address: <ARMv8 as Arch>::Address,
     colors: Option<&ColorSettings>
 ) {
-    match <ARMv8 as Arch>::Decoder::default().decode(data.range_from(address).unwrap()) {
+    match <ARMv8 as Arch>::Decoder::default().decode(&mut data.range_from(address).unwrap().to_reader()) {
         Ok(instr) => {
             let mut instr_text = String::new();
             ARMv8::render_frame(
@@ -159,7 +159,7 @@ impl <
     }
 }
 
-pub fn show_function<'a, 'b, 'c, 'd, 'e, M: MemoryRepr<<ARMv8 as Arch>::Address> + MemoryRange<<ARMv8 as Arch>::Address>>(
+pub fn show_function<'a, 'b, 'c, 'd, 'e, M: MemoryRepr<ARMv8> + MemoryRange<ARMv8>>(
     data: &'a M,
     ctx: &'b MergedContextTable,
     ssa: Option<&'d SSA<ARMv8>>,

@@ -1,7 +1,10 @@
 use yaxpeax_arch::Arch;
+use yaxpeax_arch::Decoder;
+use arch::DecodeFrom;
 use analyses::control_flow;
 use analyses::static_single_assignment::SSA;
 use analyses::xrefs;
+use memory::MemoryRepr;
 use self::analyses::data_flow::DefaultCallingConvention;
 
 use petgraph::graphmap::GraphMap;
@@ -29,10 +32,22 @@ pub mod debug;
 pub mod display;
 pub mod semantic;
 
-#[derive(Serialize, Deserialize)]
+impl<M: MemoryRepr<Self> + ?Sized> DecodeFrom<M> for x86_64 {
+    fn decode_with_decoder_into<'mem>(
+        decoder: &Self::Decoder,
+        cursor: &crate::memory::repr::ReadCursor<'mem, Self, M>,
+        instr: &mut Self::Instruction
+    ) -> Result<(), Self::DecodeError> {
+        let mut reader = cursor.to_reader();
+        decoder.decode_into(instr, &mut reader)
+    }
+}
+
+// TODO: DataMemo needs to be updated to serialize symbolic expression graphs
+// #[derive(Serialize, Deserialize)]
 #[allow(non_camel_case_types)]
 pub struct x86_64Data {
-    #[serde(skip)]
+//    #[serde(skip)]
     pub timings: Timings<<x86_64 as Arch>::Address>,
     pub preferred_addr: <x86_64 as Arch>::Address,
     pub contexts: MergedContextTable,

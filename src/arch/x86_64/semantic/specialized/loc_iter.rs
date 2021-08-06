@@ -5,8 +5,8 @@ use data::{Direction, Disambiguator};
 use arch::{FunctionQuery, FunctionImpl};
 use tracing::{event, Level};
 
-pub struct LocationIter<'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)> + ?Sized, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address> + ?Sized> {
-    _addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address,
+pub struct LocationIter<'a, 'b, 'c, D: Disambiguator<yaxpeax_x86::x86_64, (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8)> + ?Sized, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address> + ?Sized> {
+    addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address,
     inst: &'a Instruction,
     op_count: u8,
     op_idx: u8,
@@ -14,7 +14,7 @@ pub struct LocationIter<'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)> + ?Size
     loc_idx: u8,
     curr_op: Option<Operand>,
     curr_use: Option<Use>,
-    disambiguator: &'b mut D,
+    disambiguator: &'b D,
     _fn_query: &'c F,
 }
 
@@ -37,11 +37,8 @@ fn operands_in(instr: &Instruction) -> u8 {
         Opcode::CVTPS2PD |
         Opcode::LDDQU |
         Opcode::LEA |
-        Opcode::MOVSX_b |
-        Opcode::MOVSX_w |
-        Opcode::MOVZX_b |
-        Opcode::MOVZX_w |
         Opcode::MOVSX |
+        Opcode::MOVZX |
         Opcode::MOVSXD |
         Opcode::MOVAPS |
         Opcode::MOVUPS |
@@ -55,6 +52,9 @@ fn operands_in(instr: &Instruction) -> u8 {
         Opcode::XADD |
         Opcode::XCHG => {
             3
+        }
+        Opcode::PREFETCHW => {
+            2
         }
         Opcode::STI |
         Opcode::CLI |
@@ -380,10 +380,10 @@ fn locations_in(op: &Operand, usage: Use) -> u8 {
 }
 
 #[allow(dead_code)]
-impl <'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)> + ?Sized, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>> LocationIter<'a, 'b, 'c, D, F> {
-    pub fn new(_addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, inst: &'a Instruction, disambiguator: &'b mut D, _fn_query: &'c F) -> Self {
+impl <'a, 'b, 'c, D: Disambiguator<yaxpeax_x86::x86_64, (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8)> + ?Sized, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>> LocationIter<'a, 'b, 'c, D, F> {
+    pub fn new(addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, inst: &'a Instruction, disambiguator: &'b D, _fn_query: &'c F) -> Self {
         LocationIter {
-            _addr,
+            addr,
             inst,
             op_count: operands_in(inst),
             op_idx: 0,
@@ -419,11 +419,8 @@ fn use_of(instr: &Instruction, idx: u8) -> Use {
         Opcode::CVTPS2PD |
         Opcode::LDDQU |
         Opcode::LEA |
-        Opcode::MOVSX_b |
-        Opcode::MOVSX_w |
-        Opcode::MOVZX_b |
-        Opcode::MOVZX_w |
         Opcode::MOVSX |
+        Opcode::MOVZX |
         Opcode::MOVSXD |
         Opcode::MOVAPS |
         Opcode::MOVUPS |
@@ -433,6 +430,9 @@ fn use_of(instr: &Instruction, idx: u8) -> Use {
         Opcode::MOVQ |
         Opcode::MOV => {
             [Use::Write, Use::Read][idx as usize]
+        }
+        Opcode::PREFETCHW => {
+            Use::Read
         }
         Opcode::XADD |
         Opcode::XCHG => {
@@ -447,13 +447,15 @@ fn use_of(instr: &Instruction, idx: u8) -> Use {
             Use::Read
         }
         Opcode::BT |
-        Opcode::BTS |
-        Opcode::BTR |
-        Opcode::BTC |
-        Opcode::BSR |
         Opcode::BSF |
         Opcode::TZCNT => {
             Use::Read
+        }
+        Opcode::BTS |
+        Opcode::BTR |
+        Opcode::BTC |
+        Opcode::BSR => {
+            [Use::ReadWrite, Use::Read][idx as usize]
         }
         Opcode::SAR |
         Opcode::SAL |
@@ -759,11 +761,8 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
         Opcode::CVTPS2PD |
         Opcode::LDDQU |
         Opcode::LEA |
-        Opcode::MOVSX_b |
-        Opcode::MOVSX_w |
-        Opcode::MOVZX_b |
-        Opcode::MOVZX_w |
         Opcode::MOVSX |
+        Opcode::MOVZX |
         Opcode::MOVSXD |
         Opcode::MOVAPS |
         Opcode::MOVUPS |
@@ -772,6 +771,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
         Opcode::MOVAPD |
         Opcode::MOVQ |
         Opcode::MOV |
+        Opcode::PREFETCHW |
         Opcode::XADD |
         Opcode::XCHG => {
             unreachable!();
@@ -811,7 +811,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::RCR |
         Opcode::RCL |
@@ -822,7 +822,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
             [
                 (Some(Location::CF), Direction::Write),
                 (Some(Location::OF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::CBW |
         Opcode::CDQ |
@@ -832,7 +832,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Read),
                 (Some(Location::Register(RegSpec::rax())), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::ADC |
         Opcode::SBB => {
@@ -846,7 +846,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         },
         Opcode::ADD |
         Opcode::SUB |
@@ -862,7 +862,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
 
         Opcode::IMUL => {
@@ -877,7 +877,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         },
         Opcode::IDIV |
         Opcode::DIV => {
@@ -891,8 +891,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
-
+            ][i as usize].clone()
         }
         Opcode::MUL => {
             // TODO: this is lazy and assumes writes of all flags
@@ -907,7 +906,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
 
         Opcode::PUSH => {
@@ -915,14 +914,14 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Read),
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         },
         Opcode::POP => {
             [
                 (Some(Location::Register(RegSpec::rsp())), Direction::Read),
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Read),
-            ][i as usize]
+            ][i as usize].clone()
         },
         Opcode::INC |
         Opcode::DEC => {
@@ -932,7 +931,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::AF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::ENTER => {
             [
@@ -941,7 +940,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rbp())), Direction::Read),
                 (Some(Location::Register(RegSpec::rbp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::LEAVE => {
             [
@@ -949,7 +948,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Register(RegSpec::rbp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::POPF => {
             [
@@ -957,7 +956,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Read),
                 (Some(Location::Register(RegSpec::rflags())), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::PUSHF => {
             [
@@ -965,19 +964,19 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Write),
                 (Some(Location::Register(RegSpec::rflags())), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::LAHF => {
             [
                 (Some(Location::Register(RegSpec::ax())), Direction::Write),
                 (Some(Location::Register(RegSpec::rflags())), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::SAHF => {
             [
                 (Some(Location::Register(RegSpec::ax())), Direction::Read),
                 (Some(Location::Register(RegSpec::rflags())), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::TEST |
         Opcode::CMP => {
@@ -988,10 +987,17 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::SF), Direction::Write),
                 (Some(Location::ZF), Direction::Write),
                 (Some(Location::PF), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::NEG => {
-            (Some(Location::CF), Direction::Write)
+            [
+                (Some(Location::CF), Direction::Write),
+                (Some(Location::OF), Direction::Write),
+                (Some(Location::AF), Direction::Write),
+                (Some(Location::SF), Direction::Write),
+                (Some(Location::ZF), Direction::Write),
+                (Some(Location::PF), Direction::Write),
+            ][i as usize].clone()
         }
         Opcode::NOT => {
             panic!("instruction declared to not have implicit locations");
@@ -1001,7 +1007,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::ZF), Direction::Write),
                 // this is over-general
                 (Some(Location::Register(RegSpec::rax())), Direction::Read),
-            ][i as usize]
+            ][i as usize].clone()
         },
         Opcode::CALLF | // TODO: this is wrong
         Opcode::CALL => {
@@ -1009,7 +1015,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Read),
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Write),
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::JMP => {
             // for now, ignore the implicit read/write of `rip`
@@ -1025,7 +1031,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
                 (Some(Location::Register(RegSpec::rsp())), Direction::Read),
                 (Some(Location::Register(RegSpec::rsp())), Direction::Write),
                 (Some(Location::Memory(ANY)), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::LFENCE |
         Opcode::MFENCE |
@@ -1062,40 +1068,40 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
             [
                 (Some(Location::Register(RegSpec::gs())), Direction::Read),
                 (Some(Location::Register(RegSpec::gs())), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::RDTSCP => {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Write),
                 (Some(Location::Register(RegSpec::rcx())), Direction::Write),
                 (Some(Location::Register(RegSpec::rdx())), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::WRMSR => {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Read),
                 (Some(Location::Register(RegSpec::rdx())), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::RDMSR => {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Write),
                 (Some(Location::Register(RegSpec::rdx())), Direction::Write),
                 (Some(Location::Register(RegSpec::rcx())), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::RDTSC => {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Write),
                 (Some(Location::Register(RegSpec::rdx())), Direction::Write)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::RDPMC => {
             [
                 (Some(Location::Register(RegSpec::rax())), Direction::Write),
                 (Some(Location::Register(RegSpec::rdx())), Direction::Write),
                 (Some(Location::Register(RegSpec::rcx())), Direction::Read)
-            ][i as usize]
+            ][i as usize].clone()
         }
         Opcode::VERR |
         Opcode::VERW => {
@@ -1135,7 +1141,11 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
         Opcode::JLE |
         Opcode::JGE |
         Opcode::JL => {
-            cond_to_flags(op.condition().unwrap())[i as usize]
+            if i == 0 {
+                (Some(Location::RIP), Direction::Read)
+            } else {
+                cond_to_flags(op.condition().unwrap())[i as usize - 1].clone()
+            }
         }
 
         Opcode::CMOVO |
@@ -1154,7 +1164,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
         Opcode::CMOVLE |
         Opcode::CMOVGE |
         Opcode::CMOVL => {
-            cond_to_flags(op.condition().unwrap())[i as usize]
+            cond_to_flags(op.condition().unwrap())[i as usize].clone()
         }
         Opcode::SETO |
         Opcode::SETNO |
@@ -1172,7 +1182,7 @@ fn implicit_loc(op: Opcode, i: u8) -> (Option<Location>, Direction) {
         Opcode::SETLE |
         Opcode::SETGE |
         Opcode::SETL => {
-            cond_to_flags(op.condition().unwrap())[i as usize]
+            cond_to_flags(op.condition().unwrap())[i as usize].clone()
         }
         Opcode::LSL => {
             (Some(Location::ZF), Direction::Write)
@@ -1240,11 +1250,9 @@ fn implicit_locs(op: Opcode) -> u8 {
         Opcode::CVTPS2PD |
         Opcode::LDDQU |
         Opcode::LEA |
-        Opcode::MOVSX_b |
-        Opcode::MOVSX_w |
-        Opcode::MOVZX_b |
-        Opcode::MOVZX_w |
+        Opcode::PREFETCHW |
         Opcode::MOVSX |
+        Opcode::MOVZX |
         Opcode::MOVSXD |
         Opcode::MOVAPS |
         Opcode::MOVUPS |
@@ -1345,7 +1353,7 @@ fn implicit_locs(op: Opcode) -> u8 {
             6
         }
         Opcode::NEG => {
-            1
+            6
         }
         Opcode::NOT => {
             0
@@ -1451,7 +1459,8 @@ fn implicit_locs(op: Opcode) -> u8 {
         Opcode::JLE |
         Opcode::JGE |
         Opcode::JL => {
-            cond_to_flags(op.condition().unwrap()).len() as u8
+            // count rip
+            1 + cond_to_flags(op.condition().unwrap()).len() as u8
         }
 
         Opcode::CMOVO |
@@ -1539,17 +1548,18 @@ fn implicit_locs(op: Opcode) -> u8 {
 }
 #[test]
 fn test_xor_locations() {
-    use yaxpeax_arch::{Arch, Decoder};
-    let inst = <yaxpeax_x86::x86_64 as Arch>::Decoder::default().decode([0x33u8, 0xc1].iter().map(|x| *x)).unwrap();
-    use data::LocIterator;
+    use memory::MemoryRange;
+    use arch::DecodeFrom;
+    let _inst = yaxpeax_x86::x86_64::decode_from(&[0x33u8, 0xc1].range(0..2).unwrap()).unwrap();
+//    use data::LocIterator;
 //    let locs: Vec<(Option<Location>, Direction)> = inst.iter_locs(&mut NoDisambiguation::default()).collect();
 //    panic!("{:?}", locs);
 }
 
-impl <'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)>, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>> Iterator for LocationIter<'a, 'b, 'c, D, F> {
+impl <'a, 'b, 'c, D: Disambiguator<yaxpeax_x86::x86_64, (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8)>, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>> Iterator for LocationIter<'a, 'b, 'c, D, F> {
     type Item = (Option<Location>, Direction);
     fn next(&mut self) -> Option<Self::Item> {
-        fn next_loc<'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)>, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>>(iter: &mut LocationIter<'a, 'b, 'c, D, F>) -> Option<(Option<Location>, Direction)> {
+        fn next_loc<'a, 'b, 'c, D: Disambiguator<yaxpeax_x86::x86_64, (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8)>, F: FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address>>(iter: &mut LocationIter<'a, 'b, 'c, D, F>) -> Option<(Option<Location>, Direction)> {
             while iter.loc_count == iter.loc_idx {
                 // advance op
                 iter.op_idx += 1;
@@ -1582,7 +1592,7 @@ impl <'a, 'b, 'c, D: Disambiguator<Location, (u8, u8)>, F: FunctionQuery<<yaxpea
 
         next_loc(self).map(|loc| {
             let loc_spec = (self.op_idx, self.loc_idx - 1);
-            self.disambiguator.disambiguate(loc_spec).map(|new_loc| (Some(new_loc), loc.1)).unwrap_or(loc)
+            self.disambiguator.disambiguate(self.inst, loc.clone(), (self.addr, loc_spec.0, loc_spec.1)).map(|new_loc| (Some(new_loc), loc.1)).unwrap_or(loc)
         })
     }
 }
@@ -1656,17 +1666,24 @@ fn loc_by_id(idx: u8, usage: Use, op: &Operand) -> Option<(Option<Location>, Dir
         Operand::ImmediateU64(_) => {
             None
         }
-        op => {
-            panic!("loc_by_id on unknown operand: {}", op);
+        other => {
+            panic!("unhandled operand type {:?}", other);
         }
     }
 }
 
-impl <'a, 'b, 'c, D: 'b + Disambiguator<Location, (u8, u8)>, F: 'c + FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, Function=FunctionImpl<Location>>> crate::data::LocIterator<'b, 'c, <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, Location, D, F> for &'a Instruction {
+impl <
+    'a,
+    'disambiguator,
+    'fns,
+    D: 'disambiguator + Disambiguator<yaxpeax_x86::x86_64, (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8)>,
+    F: 'fns + FunctionQuery<<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address,
+    Function=FunctionImpl<Location>>
+> crate::data::LocIterator<'disambiguator, 'fns, yaxpeax_x86::x86_64, Location, D, F> for &'a Instruction {
     type Item = (Option<Location>, Direction);
-    type LocSpec = (u8, u8);
-    type Iter = LocationIter<'a, 'b, 'c, D, F>;
-    fn iter_locs(self, addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, disam: &'b mut D, functions: &'c F) -> Self::Iter {
+    type LocSpec = (<yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, u8, u8);
+    type Iter = LocationIter<'a, 'disambiguator, 'fns, D, F>;
+    fn iter_locs(self, addr: <yaxpeax_x86::x86_64 as yaxpeax_arch::Arch>::Address, disam: &'disambiguator D, functions: &'fns F) -> Self::Iter {
         LocationIter::new(addr, self, disam, functions)
     }
 }

@@ -4,6 +4,7 @@ use yaxpeax_x86::x86_64;
 use arch::x86_64::analyses::data_flow::{Data, Location, ValueRange};
 use analyses::evaluators::const_evaluator::{Domain, ConstEvaluator};
 use analyses::static_single_assignment::SSA;
+use analyses::static_single_assignment::{DataDisplay as SSADataDisplay};
 use data::Direction;
 use data::modifier::ModifierExpression;
 use data::ValueLocations;
@@ -112,7 +113,7 @@ fn referent(_instr: &Instruction, mem_op: &Operand, addr: <x86_64 as Arch>::Addr
     }
 }
 
-fn valueset_deref<U: MemoryRange<<x86_64 as Arch>::Address>>(values: Vec<ValueRange>, data: &U, size: u8) -> Option<Vec<ValueRange>> {
+fn valueset_deref<U: MemoryRange<x86_64>>(values: Vec<ValueRange>, data: &U, size: u8) -> Option<Vec<ValueRange>> {
     let mut reads: Vec<ValueRange> = Vec::new();
     for value in values {
         match value {
@@ -200,7 +201,7 @@ impl ConstEvaluator<x86_64, (), ValueSetDomain> for x86_64 {
     fn apply_transient(from: <x86_64 as Arch>::Address, to: <x86_64 as Arch>::Address, location: Option<<x86_64 as ValueLocations>::Location>, exprs: &Vec<<ValueSetDomain as Domain>::Modifier>, dfg: &SSA<x86_64>, _contexts: &()) {
         if let Some(loc) = location {
             for expr in exprs {
-                let new_value = dfg.get_transient_value(from, to, loc, Direction::Read).and_then(|_lvalue| {
+                let new_value = dfg.get_transient_value(from, to, loc.clone(), Direction::Read).and_then(|_lvalue| {
                     // TODO
 //                    lvalue.get_data().and_then(|data| data.merge_modifier(expr))
                     None
@@ -232,9 +233,9 @@ impl ConstEvaluator<x86_64, (), ValueSetDomain> for x86_64 {
                 });
 
                 if let Some(new_value) = new_value {
-                    dfg.get_transient_def(from, to, loc).update(new_value);
+                    dfg.get_transient_def(from, to, loc.clone()).update(new_value);
                 } else {
-                    dfg.get_transient_def(from, to, loc).clear();
+                    dfg.get_transient_def(from, to, loc.clone()).clear();
                 }
             }
         } else {
@@ -243,8 +244,8 @@ impl ConstEvaluator<x86_64, (), ValueSetDomain> for x86_64 {
         }
     }
 
-    fn evaluate_instruction<U: MemoryRange<<x86_64 as Arch>::Address>>(instr: &<x86_64 as Arch>::Instruction, addr: <x86_64 as Arch>::Address, dfg: &SSA<x86_64>, contexts: &(), data: &U) {
-        //TODO: handle prefixes at all
+    fn evaluate_instruction<U: MemoryRange<x86_64>>(instr: &<x86_64 as Arch>::Instruction, addr: <x86_64 as Arch>::Address, dfg: &SSA<x86_64>, contexts: &(), data: &U) {
+        //TODO: handle prefixes like at all
         match instr.opcode() {
             Opcode::MOVSXD => {
                 match (instr.operand(0), instr.operand(1)) {
@@ -257,22 +258,18 @@ impl ConstEvaluator<x86_64, (), ValueSetDomain> for x86_64 {
                     _ => {}
                 }
             }
-            Opcode::MOVZX_b => {
+            Opcode::MOVZX => {
                 match (instr.operand(0), instr.operand(1)) {
                     (Operand::Register(l), op) => {
                         if op.is_memory() {
                             // might be a pointer deref or somesuch.
-                            if let Some(Data::ValueSet(value_set)) = referent(instr, &op, addr, dfg, contexts) {
-                                if let Some(read_values) = valueset_deref(value_set.clone(), data, 1) {
-                                    let values = Data::ValueSet(value_set);
-                                    let read_values = Data::ValueSet(read_values);
-
-                                    use arch::x86_64::display::DataDisplay;
-                                    tracing::info!(
-                                        "at {}, derefed value set {} to read {}",
+                            if let Some(Data::ValueSet(values)) = referent(instr, &op, addr, dfg, contexts) {
+                                if let Some(read_values) = valueset_deref(values.clone(), data, instr.mem_size().unwrap().bytes_size().unwrap()) {
+                                    println!(
+                                        "at {}, Derefed value set {} to read {}",
                                         addr.show(),
-                                        DataDisplay { data: &values, colors: None },
-                                        DataDisplay { data: &read_values, colors: None }
+                                        Data::ValueSet(values).display(false, None),
+                                        Data::ValueSet(read_values.clone()).display(false, None),
                                     );
                                     dfg.get_def(addr, Location::Register(l)).update(
                                         read_values
@@ -290,40 +287,9 @@ impl ConstEvaluator<x86_64, (), ValueSetDomain> for x86_64 {
                     _ => {}
                 }
 
-            }
-            Opcode::MOVZX_w => {
-                match (instr.operand(0), instr.operand(1)) {
-                    (Operand::Register(l), op) => {
-                        if op.is_memory() {
-                            // might be a pointer deref or somesuch.
-                            if let Some(Data::ValueSet(value_set)) = referent(instr, &op, addr, dfg, contexts) {
-                                if let Some(read_values) = valueset_deref(value_set.clone(), data, 2) {
-                                    let values = Data::ValueSet(value_set);
-                                    let read_values = Data::ValueSet(read_values);
-
-                                    use arch::x86_64::display::DataDisplay;
-                                    tracing::info!(
-                                        "derefed value set {} to read {}",
-                                        DataDisplay { data: &values, colors: None },
-                                        DataDisplay { data: &read_values, colors: None }
-                                    );
-                                    dfg.get_def(addr, Location::Register(l)).update(
-                                        read_values
-                                    );
-                                } else {
-                                    // TODO: deref results in all values being invalid
-                                }
-                            } else {
-                                // this was handled in some other evaluator
-                            }
-                        } else {
-                            // reg-reg mov is handled in another evalator
-                        }
-                    }
-                    _ => {}
-                }
             }
             Opcode::MOV => {
+                println!("DOING MOV for {}", instr);
                 match (instr.operand(0), instr.operand(1)) {
                     (Operand::Register(l), op) => {
                         if op.is_memory() {

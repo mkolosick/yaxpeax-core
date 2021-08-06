@@ -3,7 +3,7 @@ use arch::MCU;
 use yaxpeax_arch::LengthedInstruction;
 use yaxpeax_arch::Arch;
 use yaxpeax_arch::ShowContextual;
-use memory::{MemoryRepr, MemoryRange};
+use memory::MemoryRange;
 use memory::repr::FlatMemoryRepr;
 use debug;
 use debug::DebugTarget;
@@ -467,9 +467,10 @@ impl CPU {
         println!("tblptr: 0x{:x}", self.tblptr());
         println!("");
     }
-    pub fn program<T: MemoryRange<<PIC17 as Arch>::Address>>(&mut self, program: Option<T>, config: Option<FlatMemoryRepr>) -> Result<(), String> {
-        match program.and_then(|x| x.to_flat()) {
-            Some(data) => {
+    pub fn program<T: MemoryRange<PIC17>>(&mut self, program: Option<T>, config: Option<FlatMemoryRepr>) -> Result<(), String> {
+        match program.and_then(|x| x.as_flat()) {
+            Some(flat) => {
+                let data = flat.data();
                 if data.len() > self.program.len() {
                     return Err(
                         format!(
@@ -480,9 +481,7 @@ impl CPU {
                     );
                 }
                 println!("DEBUG: writing 0x{:x} bytes of program...", data.len());
-                for i in 0..data.len() {
-                    self.program[i] = data.read(i as <PIC17 as Arch>::Address).unwrap();
-                }
+                self.program[0..data.len()].copy_from_slice(data);
             },
             None => {
                 println!("WARN: Provided program includes no code.");
@@ -510,16 +509,29 @@ impl AliasInfo for Dependence {
 }
 
 use data::types::{Typed, TypeAtlas, TypeSpec};
-impl Typed for u8 {
+impl Typed for Data {
     fn type_of(&self, _: &TypeAtlas) -> TypeSpec {
         TypeSpec::Unknown
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Data {
+    Constant(u8)
+}
+
 use analyses::static_single_assignment::{SSAValues};
 use arch::pic17::{Dependence, Update};
 impl SSAValues for PIC17 {
-    type Data = u8; // TODO: either some id of something interesting or a value?
+    type Data = Data; // TODO: either some id of something interesting or a value?
+}
+
+use crate::ColorSettings;
+impl<'data, 'colors> crate::analyses::static_single_assignment::DataDisplay<'data, 'colors> for Data {
+    type Displayer = &'static str;
+    fn display(&'data self, detailed: bool, colors: Option<&'colors ColorSettings>) -> &'static str {
+        unimplemented!()
+    }
 }
 
 use data::Direction;
@@ -567,7 +579,6 @@ impl ValueLocations for PIC17 {
 
 impl MCU for CPU {
     type Addr = u16;
-    type Decoder = <PIC17 as Arch>::Decoder;
     type Instruction = <PIC17 as Arch>::Instruction;
     fn emulate(&mut self) -> Result<(), String> {
         fn store_operand(cpu: &mut CPU, new_value: u8, dest: Operand) {
@@ -1027,7 +1038,7 @@ impl MCU for CPU {
                 self.ip += instr.len();
                 Ok(())
             },
-            Err(msg) => { panic!("pic emulation error - decode error: {}", msg); }
+            Err(msg) => { std::panic::panic_any(msg); }
         };
         if skip_next {
             match self.decode() {
@@ -1035,7 +1046,7 @@ impl MCU for CPU {
                     self.ip += next_instr.len();
                     Ok(())
                 },
-                Err(msg) => { panic!("pic emulation error - decode error: {}", msg); }
+                Err(msg) => { std::panic::panic_any(msg); }
             }
         } else {
             eval_result
@@ -1043,7 +1054,8 @@ impl MCU for CPU {
     }
 
     fn decode(&self) -> Result<Self::Instruction, String> {
-        <PIC17 as Arch>::Decoder::default().decode(self.program.range_from(self.ip).unwrap())
+        let cursor: crate::memory::repr::cursor::ReadCursor<PIC17, Vec<u8>> = self.memory.range_from(self.ip).unwrap();
+        <PIC17 as Arch>::Decoder::default().decode(&mut cursor.to_reader())
             .map_err(|err| {
                 format!(
                     "Unable to decode bytes at 0x{:x}: {:x?}, {}",
